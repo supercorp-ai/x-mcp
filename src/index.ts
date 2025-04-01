@@ -10,20 +10,31 @@ import { z } from 'zod'
 import crypto from 'crypto'
 import { Redis } from '@upstash/redis'
 
+// Use Node 22 built-in fetch and FormData
+// (No need to import node-fetch)
+
+// --------------------------------------------------------------------
+// Helper: JSON Response Formatter
+// --------------------------------------------------------------------
+function toTextJson(data: unknown): { content: Array<{ type: 'text'; text: string }> } {
+  return {
+    content: [
+      { type: 'text', text: JSON.stringify(data, null, 2) }
+    ]
+  };
+}
+
 // --------------------------------------------------------------------
 // Configuration & Storage Interface
 // --------------------------------------------------------------------
 interface Config {
   port: number;
   transport: 'sse' | 'stdio';
-  // Storage modes: "memory-single", "memory", or "upstash-redis-rest"
   storage: 'memory-single' | 'memory' | 'upstash-redis-rest';
   xClientId: string;
   xClientSecret: string;
   xRedirectUri: string;
-  // For storage "memory" and "upstash-redis-rest": the header name (or key prefix) to use.
   storageHeaderKey?: string;
-  // Upstash-specific options (if storage is "upstash-redis-rest")
   upstashRedisRestUrl?: string;
   upstashRedisRestToken?: string;
 }
@@ -44,7 +55,6 @@ class MemoryStorage implements Storage {
   }
 
   async set(memoryKey: string, data: { accessToken?: string; refreshToken?: string; userId?: string; codeVerifier?: string }) {
-    // Merge with existing data if any.
     this.storage[memoryKey] = { ...this.storage[memoryKey], ...data };
   }
 }
@@ -62,7 +72,7 @@ class RedisStorage implements Storage {
   }
 
   async get(memoryKey: string): Promise<{ accessToken?: string; refreshToken?: string; userId?: string; codeVerifier?: string } | undefined> {
-    const data = await this.redis.get<{ accessToken?: string; refreshToken?: string; userId?: string; codeVerifier?: string }>(`${this.keyPrefix}:${memoryKey}`);
+    const data = await this.redis.get(`${this.keyPrefix}:${memoryKey}`);
     return data === null ? undefined : data;
   }
 
@@ -101,9 +111,8 @@ function generateAuthUrl(config: Config, storage: Storage, memoryKey: string): s
     response_type: 'code',
     client_id: config.xClientId,
     redirect_uri: config.xRedirectUri,
-    // Request tweet.read, users.read, tweet.write and offline.access scopes.
-    scope: 'tweet.read users.read tweet.write offline.access',
-    state: 'state', // In production, use a random value to mitigate CSRF.
+    scope: 'tweet.read users.read tweet.write media.write offline.access',
+    state: 'state',
     code_challenge: pkce.codeChallenge,
     code_challenge_method: 'S256'
   });
@@ -202,13 +211,165 @@ async function auth(args: { code: string; memoryKey: string; config: Config; sto
   return { success: true, provider: "x", user };
 }
 
-async function createTweetTool(args: { tweetContent: string; memoryKey: string; config: Config; storage: Storage }): Promise<any> {
-  const { tweetContent, memoryKey, config, storage } = args;
+async function uploadMedia(mediaUrl: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
+  log("Starting media upload for URL:", mediaUrl);
+
+  // Step 0: Download media as ArrayBuffer.
+  log("Downloading media...");
+  const mediaResponse = await fetch(mediaUrl);
+  if (!mediaResponse.ok) {
+    const errText = await mediaResponse.text();
+    logErr("Error downloading media:", errText);
+    throw new Error('Failed to download media from provided URL.');
+  }
+  const mediaBuffer = await mediaResponse.arrayBuffer();
+  const totalBytes = Buffer.byteLength(Buffer.from(mediaBuffer));
+  log("Downloaded media. Total bytes:", totalBytes);
+
+  // Detect media type based on file extension.
+  const mediaType = detectMediaType(mediaUrl);
+  log("Detected media type:", mediaType);
+  const mediaCategory = 'tweet_image';
+
+  // Step 1: INIT
+  const initParams = new URLSearchParams({
+    command: 'INIT',
+    total_bytes: totalBytes.toString(),
+    media_type: mediaType,
+    media_category: mediaCategory
+  });
+  log("INIT step - parameters:", initParams.toString());
+  const initResponse = await fetch('https://api.x.com/2/media/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Bearer ${(await storage.get(memoryKey))?.accessToken}`
+    },
+    body: initParams.toString()
+  });
+  log("INIT response status:", initResponse.status);
+  const initRaw = await initResponse.text();
+  log("INIT raw response:", initRaw);
+  let initData: any;
+  try {
+    initData = JSON.parse(initRaw);
+  } catch (e) {
+    throw new Error(`Media upload INIT failed: Unable to parse response JSON. Raw response: ${initRaw}`);
+  }
+  if (!initResponse.ok || initData.errors) {
+    let errMsg = initData.errors ? initData.errors[0].message : 'Unknown error';
+    if (initResponse.status === 401) {
+      errMsg = 'Unauthorized: invalid or expired token';
+    } else if (initResponse.status === 403) {
+      errMsg = 'Forbidden: token does not have permission for media upload';
+    }
+    throw new Error(`Media upload INIT failed: ${errMsg}`);
+  }
+  const mediaId = initData.data.id;
+  log("INIT successful. Media ID received:", mediaId);
+
+  // Step 2: APPEND – Wrap the media buffer into a Blob.
+  const blob = new Blob([Buffer.from(mediaBuffer)], { type: mediaType });
+  const form = new FormData();
+  form.append('command', 'APPEND');
+  form.append('media_id', mediaId);
+  form.append('segment_index', '0');
+  form.append('media', blob, 'media.jpg'); // Pass filename only
+  log("APPEND step - sending form data.");
+  const appendResponse = await fetch('https://api.x.com/2/media/upload', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${(await storage.get(memoryKey))?.accessToken}`
+    },
+    body: form
+  });
+  log("APPEND response status:", appendResponse.status);
+  if (appendResponse.status === 204) {
+    log("APPEND returned 204: no content, treating as success.");
+  } else {
+    const appendRaw = await appendResponse.text();
+    log("APPEND raw response:", appendRaw);
+    let appendData: any;
+    try {
+      appendData = JSON.parse(appendRaw);
+    } catch (e) {
+      throw new Error(`Media upload APPEND failed: Unable to parse response JSON. Raw response: ${appendRaw}`);
+    }
+    if (!appendResponse.ok || appendData.errors) {
+      let errMsg = appendData.errors ? appendData.errors[0].message : 'Unknown error';
+      if (appendResponse.status === 401) {
+        errMsg = 'Unauthorized: invalid or expired token';
+      } else if (appendResponse.status === 403) {
+        errMsg = 'Forbidden: token does not have permission for media upload';
+      }
+      throw new Error(`Media upload APPEND failed: ${errMsg}`);
+    }
+  }
+
+  // Step 3: FINALIZE
+  const finalizeParams = new URLSearchParams({
+    command: 'FINALIZE',
+    media_id: mediaId
+  });
+  log("FINALIZE step - parameters:", finalizeParams.toString());
+  const finalizeResponse = await fetch('https://api.x.com/2/media/upload', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Bearer ${(await storage.get(memoryKey))?.accessToken}`
+    },
+    body: finalizeParams.toString()
+  });
+  log("FINALIZE response status:", finalizeResponse.status);
+  const finalizeRaw = await finalizeResponse.text();
+  log("FINALIZE raw response:", finalizeRaw);
+  let finalizeData: any;
+  try {
+    finalizeData = JSON.parse(finalizeRaw);
+  } catch (e) {
+    throw new Error(`Media upload FINALIZE failed: Unable to parse response JSON. Raw response: ${finalizeRaw}`);
+  }
+  if (!finalizeResponse.ok || finalizeData.errors) {
+    let errMsg = finalizeData.errors ? finalizeData.errors[0].message : 'Unknown error';
+    if (finalizeResponse.status === 401) {
+      errMsg = 'Unauthorized: invalid or expired token';
+    } else if (finalizeResponse.status === 403) {
+      errMsg = 'Forbidden: token does not have permission for media upload';
+    }
+    throw new Error(`Media upload FINALIZE failed: ${errMsg}`);
+  }
+  log("FINALIZE successful. Media uploaded with ID:", mediaId);
+  return mediaId;
+}
+
+/**
+ * Helper to detect media MIME type from the file extension of the URL.
+ */
+function detectMediaType(mediaUrl: string): string {
+  const lower = mediaUrl.toLowerCase();
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  return 'image/jpeg';
+}
+
+// --------------------------------------------------------------------
+// Modified Tweet Creation Tool: supports optional media upload and replying
+// --------------------------------------------------------------------
+async function createTweetTool(args: { tweetContent: string; mediaUrl?: string; inReplyToTweetId?: string; memoryKey: string; config: Config; storage: Storage }): Promise<any> {
+  const { tweetContent, mediaUrl, inReplyToTweetId, memoryKey, config, storage } = args;
   const stored = await storage.get(memoryKey);
   if (!stored || !stored.accessToken || !stored.userId) {
     throw new Error(`No X authentication configured for key "${memoryKey}". Run x_exchange_auth_code first.`);
   }
-  const postData = { text: tweetContent };
+  const postData: any = { text: tweetContent };
+  if (inReplyToTweetId) {
+    postData.reply = { in_reply_to_tweet_id: inReplyToTweetId };
+  }
+  if (mediaUrl && mediaUrl.trim()) {
+    const mediaId = await uploadMedia(mediaUrl, config, storage, memoryKey);
+    postData.media = { media_ids: [mediaId] };
+  }
   const response = await autorefreshFetch('https://api.x.com/2/tweets', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -218,7 +379,8 @@ async function createTweetTool(args: { tweetContent: string; memoryKey: string; 
     const errorText = await response.text();
     throw new Error(`X tweet creation failed: ${errorText}`);
   }
-  return { success: true, message: 'Tweet created successfully.' };
+  const result = await response.json();
+  return { success: true, message: 'Tweet created successfully.', result };
 }
 
 async function getTweetsTool(args: { query: string; memoryKey: string; config: Config; storage: Storage }): Promise<any> {
@@ -234,25 +396,9 @@ async function getTweetsTool(args: { query: string; memoryKey: string; config: C
 }
 
 // --------------------------------------------------------------------
-// Helper: JSON Response Formatter
+// MCP Server Creation: Register X Tools with Configurable Prefix
 // --------------------------------------------------------------------
-function toTextJson(data: unknown) {
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(data, null, 2)
-      }
-    ]
-  };
-}
-
-// --------------------------------------------------------------------
-// Create an X MCP server
-// This function creates the storage instance based on the config and returns
-// an MCP server using the provided memoryKey.
-// --------------------------------------------------------------------
-function createXServer(memoryKey: string, config: Config): McpServer {
+function createXServer(memoryKey: string, config: Config, toolsPrefix: string): McpServer {
   let storage: Storage;
   if (config.storage === 'upstash-redis-rest') {
     storage = new RedisStorage(
@@ -269,7 +415,7 @@ function createXServer(memoryKey: string, config: Config): McpServer {
   });
 
   server.tool(
-    'x_auth_url',
+    `${toolsPrefix}auth_url`,
     'Return an OAuth URL for X (visit this URL to grant access with tweet.read, users.read, tweet.write, and offline.access scopes).',
     {},
     async () => {
@@ -283,7 +429,7 @@ function createXServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'x_exchange_auth_code',
+    `${toolsPrefix}exchange_auth_code`,
     'Set up X authentication by exchanging an auth code.',
     { code: z.string() },
     async (args) => {
@@ -297,12 +443,16 @@ function createXServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'x_create_tweet',
-    'Create a new tweet on X on behalf of the authenticated user. Provide tweetContent as text.',
-    { tweetContent: z.string() },
-    async (args) => {
+    `${toolsPrefix}create_tweet`,
+    'Create a new tweet on X. Provide tweetContent as text. Optionally, provide mediaUrl to upload an image and inReplyToTweetId to reply to a tweet.',
+    {
+      tweetContent: z.string(),
+      mediaUrl: z.string().optional(),
+      inReplyToTweetId: z.string().optional()
+    },
+    async (args: { tweetContent: string; mediaUrl?: string; inReplyToTweetId?: string }) => {
       try {
-        const result = await createTweetTool({ tweetContent: args.tweetContent, memoryKey, config, storage });
+        const result = await createTweetTool({ tweetContent: args.tweetContent, mediaUrl: args.mediaUrl, inReplyToTweetId: args.inReplyToTweetId, memoryKey, config, storage });
         return toTextJson(result);
       } catch (err: any) {
         return toTextJson({ error: String(err.message) });
@@ -311,10 +461,10 @@ function createXServer(memoryKey: string, config: Config): McpServer {
   );
 
   server.tool(
-    'x_get_tweets',
+    `${toolsPrefix}get_tweets`,
     'Search for recent tweets on X. Provide a query string to search for tweets.',
     { query: z.string() },
-    async (args) => {
+    async (args: { query: string }) => {
       try {
         const result = await getTweetsTool({ query: args.query, memoryKey, config, storage });
         return toTextJson(result);
@@ -358,6 +508,7 @@ async function main() {
     .option('storageHeaderKey', { type: 'string', describe: 'For storage "memory" or "upstash-redis-rest": the header name (or key prefix) to use.' })
     .option('upstashRedisRestUrl', { type: 'string', describe: 'Upstash Redis REST URL (if --storage=upstash-redis-rest)' })
     .option('upstashRedisRestToken', { type: 'string', describe: 'Upstash Redis REST token (if --storage=upstash-redis-rest)' })
+    .option('toolsPrefix', { type: 'string', default: 'x_', describe: 'Prefix to add to all tool names.' })
     .help()
     .parseSync();
 
@@ -378,7 +529,6 @@ async function main() {
     upstashRedisRestToken: argv.upstashRedisRestToken,
   };
 
-  // Validate Upstash Redis options if using upstash-redis-rest.
   if (config.storage === 'upstash-redis-rest') {
     if (!config.upstashRedisRestUrl || !config.upstashRedisRestUrl.trim()) {
       logErr("Error: --upstashRedisRestUrl is required for storage mode 'upstash-redis-rest'.");
@@ -390,19 +540,18 @@ async function main() {
     }
   }
 
+  const toolsPrefix: string = argv.toolsPrefix;
+
   if (config.transport === 'stdio') {
-    // For stdio, always run in memory-single mode.
     const memoryKey = "single";
-    const server = createXServer(memoryKey, config);
+    const server = createXServer(memoryKey, config, toolsPrefix);
     const transport = new StdioServerTransport();
     await server.connect(transport);
     log('Listening on stdio');
     return;
   }
 
-  // For SSE transport:
   const app = express();
-
   interface ServerSession {
     memoryKey: string;
     server: McpServer;
@@ -411,7 +560,6 @@ async function main() {
   }
   let sessions: ServerSession[] = [];
 
-  // Parse JSON on all routes except /message.
   app.use((req, res, next) => {
     if (req.path === '/message') return next();
     express.json()(req, res, next);
@@ -419,19 +567,17 @@ async function main() {
 
   app.get('/', async (req: Request, res: ExpressResponse) => {
     let memoryKey: string;
-    if (config.storage === 'memory-single') {
+    if ((argv.storage as string) === 'memory-single') {
       memoryKey = "single";
     } else {
-      // For "memory" or "upstash-redis-rest", use the header named by storageHeaderKey.
-      const headerVal = req.headers[config.storageHeaderKey!.toLowerCase()];
+      const headerVal = req.headers[(argv.storageHeaderKey as string).toLowerCase()];
       if (typeof headerVal !== 'string' || !headerVal.trim()) {
-        res.status(400).json({ error: `Missing or invalid "${config.storageHeaderKey}" header` });
+        res.status(400).json({ error: `Missing or invalid "${argv.storageHeaderKey}" header` });
         return;
       }
       memoryKey = headerVal.trim();
     }
-
-    const server = createXServer(memoryKey, config);
+    const server = createXServer(memoryKey, config, toolsPrefix);
     const transport = new SSEServerTransport('/message', res);
     await server.connect(transport);
     const sessionId = transport.sessionId;
@@ -454,11 +600,13 @@ async function main() {
   app.post('/message', async (req: Request, res: ExpressResponse) => {
     const sessionId = req.query.sessionId as string;
     if (!sessionId) {
+      logErr('Missing sessionId');
       res.status(400).send({ error: 'Missing sessionId' });
       return;
     }
     const target = sessions.find(s => s.sessionId === sessionId);
     if (!target) {
+      logErr(`No active session for sessionId=${sessionId}`);
       res.status(404).send({ error: 'No active session' });
       return;
     }
@@ -470,12 +618,12 @@ async function main() {
     }
   });
 
-  app.listen(config.port, () => {
-    log(`Listening on port ${config.port} [storage=${config.storage}]`);
+  app.listen(argv.port, () => {
+    log(`Listening on port ${argv.port} (${argv.transport})`);
   });
 }
 
-main().catch(err => {
+main().catch((err: any) => {
   logErr('Fatal error:', err);
   process.exit(1);
 });
