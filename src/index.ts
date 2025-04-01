@@ -62,13 +62,8 @@ class RedisStorage implements Storage {
   }
 
   async get(memoryKey: string): Promise<{ accessToken?: string; refreshToken?: string; userId?: string; codeVerifier?: string } | undefined> {
-    const data = await this.redis.get<string>(`${this.keyPrefix}:${memoryKey}`);
-    if (!data) return undefined;
-    try {
-      return JSON.parse(data);
-    } catch (err) {
-      return undefined;
-    }
+    const data = await this.redis.get<{ accessToken?: string; refreshToken?: string; userId?: string; codeVerifier?: string }>(`${this.keyPrefix}:${memoryKey}`);
+    return data === null ? undefined : data;
   }
 
   async set(memoryKey: string, data: { accessToken?: string; refreshToken?: string; userId?: string; codeVerifier?: string }) {
