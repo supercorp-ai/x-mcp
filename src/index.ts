@@ -142,6 +142,7 @@ async function exchangeAuthCode(code: string, config: Config, storage: Storage, 
   });
   const data = await response.json();
   if (!data.access_token) {
+    console.dir({ data }, { depth: null });
     throw new Error('Failed to obtain X access token.');
   }
   await storage.set(memoryKey, { accessToken: data.access_token, refreshToken: data.refresh_token });
