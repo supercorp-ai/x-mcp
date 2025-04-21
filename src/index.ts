@@ -447,7 +447,7 @@ function createXServer(memoryKey: string, config: Config, toolsPrefix: string): 
     `${toolsPrefix}create_tweet`,
     'Create a new tweet on X. Provide tweetContent as text. Optionally, provide mediaUrl to upload an image and inReplyToTweetId to reply to a tweet.',
     {
-      tweetContent: z.string(),
+      tweetContent: z.string().min(1).max(280),
       mediaUrl: z.string().optional(),
       inReplyToTweetId: z.string().optional()
     },
