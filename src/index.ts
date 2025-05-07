@@ -418,7 +418,10 @@ function createXServer(memoryKey: string, config: Config, toolsPrefix: string): 
   server.tool(
     `${toolsPrefix}auth_url`,
     'Return an OAuth URL for X (visit this URL to grant access with tweet.read, users.read, tweet.write, and offline.access scopes).',
-    {},
+    {
+      // TODO: MCP SDK bug patch - remove when fixed
+      comment: z.string().optional(),
+    },
     async () => {
       try {
         const authUrl = generateAuthUrl(config, storage, memoryKey);
