@@ -250,7 +250,7 @@ async function uploadMedia(
   const initJson = await initRes.json();
   if (!initRes.ok || !initJson?.data?.id) {
     const msg = initJson?.errors?.[0]?.message ?? "Unknown error";
-    throw new Error(`Media upload INITIALIZE failed: ${msg}`);
+    throw new Error(`Media upload INITIALIZE failed: ${msg}. Please reauthorize to use the new version of the X API be able to post images.`);
   }
   const mediaId = initJson.data.id;
   log("INITIALIZE successful – media_id:", mediaId);
