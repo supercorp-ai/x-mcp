@@ -212,135 +212,86 @@ async function auth(args: { code: string; memoryKey: string; config: Config; sto
   return { success: true, provider: "x", user };
 }
 
-async function uploadMedia(mediaUrl: string, config: Config, storage: Storage, memoryKey: string): Promise<string> {
+async function uploadMedia(
+  mediaUrl: string,
+  _config: Config,
+  storage: Storage,
+  memoryKey: string
+): Promise<string> {
   log("Starting media upload for URL:", mediaUrl);
 
-  // Step 0: Download media as ArrayBuffer.
-  log("Downloading media...");
+  // ───────────────────────────────────────────────────────────────────
+  // Download the file we are about to upload
+  // ───────────────────────────────────────────────────────────────────
   const mediaResponse = await fetch(mediaUrl);
   if (!mediaResponse.ok) {
-    const errText = await mediaResponse.text();
-    logErr("Error downloading media:", errText);
-    throw new Error('Failed to download media from provided URL.');
+    throw new Error(`Failed to download media from ${mediaUrl}: ${await mediaResponse.text()}`);
   }
   const mediaBuffer = await mediaResponse.arrayBuffer();
   const totalBytes = Buffer.byteLength(Buffer.from(mediaBuffer));
-  log("Downloaded media. Total bytes:", totalBytes);
-
-  // Detect media type based on file extension.
   const mediaType = detectMediaType(mediaUrl);
-  log("Detected media type:", mediaType);
-  const mediaCategory = 'tweet_image';
+  const mediaCategory = "tweet_image"; // unchanged
 
-  // Step 1: INIT
-  const initParams = new URLSearchParams({
-    command: 'INIT',
-    total_bytes: totalBytes.toString(),
-    media_type: mediaType,
-    media_category: mediaCategory
-  });
-  log("INIT step - parameters:", initParams.toString());
-  const initResponse = await fetch('https://api.x.com/2/media/upload', {
-    method: 'POST',
+  // ───────────────────────────────────────────────────────────────────
+  // 1. INITIALIZE
+  // ───────────────────────────────────────────────────────────────────
+  const initRes = await fetch("https://api.x.com/2/media/upload/initialize", {
+    method: "POST",
     headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Authorization': `Bearer ${(await storage.get(memoryKey))?.accessToken}`
+      "Authorization": `Bearer ${(await storage.get(memoryKey))?.accessToken}`,
+      "Content-Type": "application/json"
     },
-    body: initParams.toString()
+    body: JSON.stringify({
+      media_type: mediaType,
+      media_category: mediaCategory,
+      total_bytes: totalBytes
+    })
   });
-  log("INIT response status:", initResponse.status);
-  const initRaw = await initResponse.text();
-  log("INIT raw response:", initRaw);
-  let initData: any;
-  try {
-    initData = JSON.parse(initRaw);
-  } catch (e) {
-    throw new Error(`Media upload INIT failed: Unable to parse response JSON. Raw response: ${initRaw}`);
+  const initJson = await initRes.json();
+  if (!initRes.ok || !initJson?.data?.id) {
+    const msg = initJson?.errors?.[0]?.message ?? "Unknown error";
+    throw new Error(`Media upload INITIALIZE failed: ${msg}`);
   }
-  if (!initResponse.ok || initData.errors) {
-    let errMsg = initData.errors ? initData.errors[0].message : 'Unknown error';
-    if (initResponse.status === 401) {
-      errMsg = 'Unauthorized: invalid or expired token';
-    } else if (initResponse.status === 403) {
-      errMsg = 'Forbidden: token does not have permission for media upload';
-    }
-    throw new Error(`Media upload INIT failed: ${errMsg}`);
-  }
-  const mediaId = initData.data.id;
-  log("INIT successful. Media ID received:", mediaId);
+  const mediaId = initJson.data.id;
+  log("INITIALIZE successful – media_id:", mediaId);
 
-  // Step 2: APPEND – Wrap the media buffer into a Blob.
+  // ───────────────────────────────────────────────────────────────────
+  // 2. APPEND   (single chunk for images)
+  // ───────────────────────────────────────────────────────────────────
+  const appendUrl = `https://api.x.com/2/media/upload/${mediaId}/append`;
   const blob = new Blob([Buffer.from(mediaBuffer)], { type: mediaType });
   const form = new FormData();
-  form.append('command', 'APPEND');
-  form.append('media_id', mediaId);
-  form.append('segment_index', '0');
-  form.append('media', blob, 'media.jpg'); // Pass filename only
-  log("APPEND step - sending form data.");
-  const appendResponse = await fetch('https://api.x.com/2/media/upload', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${(await storage.get(memoryKey))?.accessToken}`
-    },
+  form.append("segment_index", "0");
+  form.append("media", blob, "upload" + mediaType.replace("/", "."));
+
+  const appendRes = await fetch(appendUrl, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${(await storage.get(memoryKey))?.accessToken}` },
     body: form
   });
-  log("APPEND response status:", appendResponse.status);
-  if (appendResponse.status === 204) {
-    log("APPEND returned 204: no content, treating as success.");
-  } else {
-    const appendRaw = await appendResponse.text();
-    log("APPEND raw response:", appendRaw);
-    let appendData: any;
-    try {
-      appendData = JSON.parse(appendRaw);
-    } catch (e) {
-      throw new Error(`Media upload APPEND failed: Unable to parse response JSON. Raw response: ${appendRaw}`);
-    }
-    if (!appendResponse.ok || appendData.errors) {
-      let errMsg = appendData.errors ? appendData.errors[0].message : 'Unknown error';
-      if (appendResponse.status === 401) {
-        errMsg = 'Unauthorized: invalid or expired token';
-      } else if (appendResponse.status === 403) {
-        errMsg = 'Forbidden: token does not have permission for media upload';
-      }
-      throw new Error(`Media upload APPEND failed: ${errMsg}`);
-    }
+  if (!appendRes.ok && appendRes.status !== 204) {
+    const appendJson = await appendRes.json().catch(() => ({}));
+    const msg = appendJson?.errors?.[0]?.message ?? `HTTP ${appendRes.status}`;
+    throw new Error(`Media upload APPEND failed: ${msg}`);
   }
+  log("APPEND successful.");
 
-  // Step 3: FINALIZE
-  const finalizeParams = new URLSearchParams({
-    command: 'FINALIZE',
-    media_id: mediaId
+  // ───────────────────────────────────────────────────────────────────
+  // 3. FINALIZE
+  // ───────────────────────────────────────────────────────────────────
+  const finalizeUrl = `https://api.x.com/2/media/upload/${mediaId}/finalize`;
+  const finalRes = await fetch(finalizeUrl, {
+    method: "POST",
+    headers: { "Authorization": `Bearer ${(await storage.get(memoryKey))?.accessToken}` }
   });
-  log("FINALIZE step - parameters:", finalizeParams.toString());
-  const finalizeResponse = await fetch('https://api.x.com/2/media/upload', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'Authorization': `Bearer ${(await storage.get(memoryKey))?.accessToken}`
-    },
-    body: finalizeParams.toString()
-  });
-  log("FINALIZE response status:", finalizeResponse.status);
-  const finalizeRaw = await finalizeResponse.text();
-  log("FINALIZE raw response:", finalizeRaw);
-  let finalizeData: any;
-  try {
-    finalizeData = JSON.parse(finalizeRaw);
-  } catch (e) {
-    throw new Error(`Media upload FINALIZE failed: Unable to parse response JSON. Raw response: ${finalizeRaw}`);
+  const finalJson = await finalRes.json();
+  if (!finalRes.ok || finalJson?.errors?.length) {
+    const msg = finalJson?.errors?.[0]?.message ?? "Unknown error";
+    throw new Error(`Media upload FINALIZE failed: ${msg}`);
   }
-  if (!finalizeResponse.ok || finalizeData.errors) {
-    let errMsg = finalizeData.errors ? finalizeData.errors[0].message : 'Unknown error';
-    if (finalizeResponse.status === 401) {
-      errMsg = 'Unauthorized: invalid or expired token';
-    } else if (finalizeResponse.status === 403) {
-      errMsg = 'Forbidden: token does not have permission for media upload';
-    }
-    throw new Error(`Media upload FINALIZE failed: ${errMsg}`);
-  }
-  log("FINALIZE successful. Media uploaded with ID:", mediaId);
-  return mediaId;
+  log("FINALIZE successful. Media ready:", mediaId);
+
+  return mediaId; // ← returned exactly as before
 }
 
 /**
